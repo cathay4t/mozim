@@ -1,0 +1,14 @@
+[package]
+name = "dhcpc"
+version = "0.1.0"
+authors = ["Gris Ge <fge@redhat.com>"]
+edition = "2018"
+
+[lib]
+path = "lib.rs"
+crate-type = ["lib"]
+
+[dependencies]
+rand = "0.8"
+libc = "0.2.81"
+nispor = "1.0.1"

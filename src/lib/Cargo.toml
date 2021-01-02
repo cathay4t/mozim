@@ -5,8 +5,8 @@ authors = ["Gris Ge <fge@redhat.com>"]
 license = "Apache-2.0"
 edition = "2018"
 description = "Rust binding of mozim(DHCP Client)"
-homepage = "https://github.com/nispor/nispor"
-repository = "https://github.com/nispor/nispor"
+homepage = "https://github.com/cathay4t/mozim"
+repository = "https://github.com/cathay4t/mozim"
 keywords = ["network"]
 categories = ["network-programming", "os"]
 

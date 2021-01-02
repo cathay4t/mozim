@@ -15,6 +15,7 @@
 mod threads_manager;
 mod thread_manager;
 mod dhcp_manager;
+mod dhcp_worker;
 
 use crate::threads_manager::MozimThreadsManager;
 use mozim::{

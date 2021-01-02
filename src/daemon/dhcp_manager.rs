@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::dhcp_worker::{MozimDhcpWorkCmd, MozimDhcpWorker};
 use mozim::{DhcpState, DhcpStatus, MozimError};
 use serde_json;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 #[derive(Debug)]
 pub(crate) enum MozimDhcpCmd {
@@ -38,19 +39,33 @@ impl MozimDhcpManager {
             );
         }
     }
+
     pub(crate) fn run(
         iface_name: String,
         sender: SyncSender<Result<String, MozimError>>,
         // TODO: _dhcp_worker_sender will moved to DHCP worker thread
         // where MozimDhcpManager could get DHCP status update from.
-        _dhcp_worker_sender: SyncSender<MozimDhcpCmd>,
+        dhcp_worker_sender: SyncSender<MozimDhcpCmd>,
         recver: Receiver<MozimDhcpCmd>,
     ) {
         let mgr = MozimDhcpManager {
-            iface_name,
+            iface_name: iface_name.clone(),
             sender,
             recver,
         };
+
+        let (worker_sender, worker_recver) =
+            sync_channel::<MozimDhcpWorkCmd>(0);
+
+        std::thread::Builder::new()
+            .name(format!("dhcp_worker_{}", &iface_name))
+            .spawn(move || {
+                MozimDhcpWorker::run(
+                    iface_name.clone(),
+                    dhcp_worker_sender,
+                    worker_recver,
+                )
+            });
         loop {
             if let Ok(cmd) = mgr.recver.recv() {
                 match cmd {
