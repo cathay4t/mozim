@@ -1,7 +1,7 @@
 # Mozim -- DHCP Client Daemon
 
 Still doing code sign, no real work this project can do yet.
-Check again in 2021.
+Check again in 2022.
 
 ## Goal
  * Provides UNIX socket interface for CLI and Daemon communication.
