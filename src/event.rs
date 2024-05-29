@@ -1,6 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
+use std::time::Duration;
 
 use nix::sys::epoll::{
     epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp,
@@ -10,77 +12,138 @@ use crate::{time::DhcpTimerFd, DhcpError, ErrorKind};
 
 const EVENT_BUFFER_COUNT: usize = 64;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-pub enum DhcpV4Event {
-    RawPackageIn = 1,
-    UdpPackageIn,
-    DiscoveryTimeout,
-    RequestTimeout,
-    Timeout,
-    Renew,
-    RenewRetry,
-    Rebind,
-    RebindRetry,
-    LeaseExpired,
+pub(crate) trait DhcpEvent:
+    std::fmt::Display
+    + Into<u64>
+    + Eq
+    + std::hash::Hash
+    + TryFrom<u64, Error = DhcpError>
+    + Copy
+{
 }
 
-impl TryFrom<u64> for DhcpV4Event {
-    type Error = DhcpError;
-    fn try_from(v: u64) -> Result<Self, DhcpError> {
-        match v {
-            x if x == Self::RawPackageIn as u64 => Ok(Self::RawPackageIn),
-            x if x == Self::UdpPackageIn as u64 => Ok(Self::UdpPackageIn),
-            x if x == Self::DiscoveryTimeout as u64 => {
-                Ok(Self::DiscoveryTimeout)
-            }
-            x if x == Self::RequestTimeout as u64 => Ok(Self::RequestTimeout),
-            x if x == Self::Timeout as u64 => Ok(Self::Timeout),
-            x if x == Self::Renew as u64 => Ok(Self::Renew),
-            x if x == Self::RenewRetry as u64 => Ok(Self::RenewRetry),
-            x if x == Self::Rebind as u64 => Ok(Self::Rebind),
-            x if x == Self::RebindRetry as u64 => Ok(Self::RebindRetry),
-            x if x == Self::LeaseExpired as u64 => Ok(Self::LeaseExpired),
-            _ => {
+#[derive(Debug)]
+pub(crate) struct DhcpEpoll {
+    pub(crate) fd: RawFd,
+}
+
+impl AsRawFd for DhcpEpoll {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl DhcpEpoll {
+    pub(crate) fn new() -> Result<Self, DhcpError> {
+        Ok(Self {
+            fd: epoll_create().map_err(|e| {
                 let e = DhcpError::new(
                     ErrorKind::Bug,
-                    format!("Got unexpected event ID {v}"),
+                    format!("Failed to epoll_create(): {e}"),
                 );
                 log::error!("{}", e);
-                Err(e)
+                e
+            })?,
+        })
+    }
+
+    pub(crate) fn add_fd<T>(&self, fd: RawFd, event: T) -> Result<(), DhcpError>
+    where
+        T: DhcpEvent,
+    {
+        log::debug!("Adding event {} to epoll {}", event, self.fd);
+        let event = EpollEvent::new(EpollFlags::EPOLLIN, event.into());
+        epoll_ctl(self.fd, EpollOp::EpollCtlAdd, fd, &mut Some(event)).map_err(
+            |e| {
+                let e = DhcpError::new(
+                    ErrorKind::Bug,
+                    format!(
+                        "Failed to epoll_ctl({}, {:?}, {}, {:?}): {}",
+                        self.fd,
+                        EpollOp::EpollCtlAdd,
+                        fd,
+                        event,
+                        e
+                    ),
+                );
+                log::error!("{}", e);
+                e
+            },
+        )
+    }
+
+    pub(crate) fn del_fd<T>(&self, fd: RawFd, event: T) -> Result<(), DhcpError>
+    where
+        T: DhcpEvent,
+    {
+        log::debug!(
+            "Removing fd {} from Epoll {}, event {}",
+            fd,
+            self.fd,
+            event
+        );
+        let event = EpollEvent::new(EpollFlags::EPOLLIN, event.into());
+        epoll_ctl(self.fd, EpollOp::EpollCtlDel, fd, &mut Some(event)).map_err(
+            |e| {
+                let e = DhcpError::new(
+                    ErrorKind::Bug,
+                    format!(
+                        "Failed to epoll_ctl({}, {:?}, {}, {:?}): {}",
+                        self.fd,
+                        EpollOp::EpollCtlDel,
+                        fd,
+                        event,
+                        e
+                    ),
+                );
+                log::error!("{}", e);
+                e
+            },
+        )
+    }
+
+    pub(crate) fn poll<T>(&self, wait_time: isize) -> Result<Vec<T>, DhcpError>
+    where
+        T: DhcpEvent,
+    {
+        let mut events: [EpollEvent; EVENT_BUFFER_COUNT] =
+            [EpollEvent::empty(); EVENT_BUFFER_COUNT];
+
+        loop {
+            match epoll_wait(self.fd, &mut events, 1000 * wait_time) {
+                Ok(c) => {
+                    let mut ret = Vec::new();
+                    for i in &events[..c] {
+                        ret.push(T::try_from(i.data())?);
+                    }
+                    return Ok(ret);
+                }
+                Err(e) => match e {
+                    nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN => {
+                        // retry
+                        continue;
+                    }
+                    _ => {
+                        let e = DhcpError::new(
+                            ErrorKind::Bug,
+                            format!("Failed on epoll_wait(): {e}"),
+                        );
+                        return Err(e);
+                    }
+                },
             }
         }
     }
 }
 
-impl std::fmt::Display for DhcpV4Event {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::RawPackageIn => "RawPackageIn",
-                Self::UdpPackageIn => "UdpPackageIn",
-                Self::DiscoveryTimeout => "DiscoveryTimeout",
-                Self::RequestTimeout => "RequestTimeout",
-                Self::Timeout => "Timeout",
-                Self::Renew => "Renew",
-                Self::RenewRetry => "RenewRetry",
-                Self::Rebind => "Rebind",
-                Self::RebindRetry => "RebindRetry",
-                Self::LeaseExpired => "LeaseExpired",
-            }
-        )
-    }
-}
-
 #[derive(Debug)]
-pub(crate) struct DhcpEventPool {
-    timer_fds: HashMap<DhcpV4Event, DhcpTimerFd>,
-    socket_fds: HashMap<DhcpV4Event, RawFd>,
+pub(crate) struct DhcpEventPool<T: DhcpEvent> {
+    timer_fds: HashMap<T, DhcpTimerFd>,
+    socket_fds: HashMap<T, RawFd>,
     pub(crate) epoll: DhcpEpoll,
 }
 
-impl Drop for DhcpEventPool {
+impl<T: DhcpEvent> Drop for DhcpEventPool<T> {
     fn drop(&mut self) {
         self.remove_all_event();
         if self.epoll.fd >= 0 {
@@ -91,7 +154,7 @@ impl Drop for DhcpEventPool {
     }
 }
 
-impl DhcpEventPool {
+impl<T: DhcpEvent> DhcpEventPool<T> {
     pub(crate) fn remove_all_event(&mut self) {
         for (event, timer_fd) in self.timer_fds.drain() {
             self.epoll.del_fd(timer_fd.as_raw_fd(), event).ok();
@@ -112,21 +175,28 @@ impl DhcpEventPool {
     pub(crate) fn add_socket(
         &mut self,
         fd: RawFd,
-        event: DhcpV4Event,
+        event: T,
     ) -> Result<(), DhcpError> {
         log::debug!("Adding socket {} with event {} to event pool", fd, event);
         self.socket_fds.insert(event, fd);
         self.epoll.add_fd(fd, event)
     }
 
+    pub(crate) fn del_socket(&mut self, event: T) -> Result<(), DhcpError> {
+        if let Some(fd) = self.socket_fds.remove(&event) {
+            self.epoll.del_fd(fd, event)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn add_timer(
         &mut self,
-        timeout: u32,
-        event: DhcpV4Event,
+        timeout: Duration,
+        event: T,
     ) -> Result<(), DhcpError> {
         log::debug!(
-            "Adding timer {} seconds with event {} to event pool",
-            timeout,
+            "Adding timer {} milliseconds with event {} to event pool",
+            timeout.as_millis(),
             event
         );
         let timer_fd = DhcpTimerFd::new(timeout)?;
@@ -135,135 +205,23 @@ impl DhcpEventPool {
         Ok(())
     }
 
-    pub(crate) fn del_timer(
-        &mut self,
-        event: DhcpV4Event,
-    ) -> Result<(), DhcpError> {
+    pub(crate) fn del_timer(&mut self, event: T) -> Result<(), DhcpError> {
         if let Some(timer_fd) = self.timer_fds.remove(&event) {
             self.epoll.del_fd(timer_fd.as_raw_fd(), event)?;
         }
         Ok(())
     }
 
-    pub(crate) fn poll(
-        &self,
-        wait_time: u32,
-    ) -> Result<Vec<DhcpV4Event>, DhcpError> {
+    pub(crate) fn poll(&self, wait_time: u32) -> Result<Vec<T>, DhcpError> {
         match isize::try_from(wait_time) {
             Ok(i) => self.epoll.poll(i),
             Err(_) => Err(DhcpError::new(
                 ErrorKind::InvalidArgument,
                 format!(
-                    "Invalid timeout, should be in the range of \
-                            0 - {}",
+                    "Invalid timeout, should be in the range of 0 - {}",
                     isize::MAX
                 ),
             )),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DhcpEpoll {
-    fd: RawFd,
-}
-
-impl AsRawFd for DhcpEpoll {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
-impl DhcpEpoll {
-    fn new() -> Result<Self, DhcpError> {
-        Ok(Self {
-            fd: epoll_create().map_err(|e| {
-                let e = DhcpError::new(
-                    ErrorKind::Bug,
-                    format!("Failed to epoll_create(): {e}"),
-                );
-                log::error!("{}", e);
-                e
-            })?,
-        })
-    }
-
-    fn add_fd(&self, fd: RawFd, event: DhcpV4Event) -> Result<(), DhcpError> {
-        log::debug!("Adding fd {} to Epoll {}, event {}", fd, self.fd, event);
-        let event = EpollEvent::new(EpollFlags::EPOLLIN, event as u64);
-        epoll_ctl(self.fd, EpollOp::EpollCtlAdd, fd, &mut Some(event)).map_err(
-            |e| {
-                let e = DhcpError::new(
-                    ErrorKind::Bug,
-                    format!(
-                        "Failed to epoll_ctl({}, {:?}, {}, {:?}): {}",
-                        self.fd,
-                        EpollOp::EpollCtlAdd,
-                        fd,
-                        event,
-                        e
-                    ),
-                );
-                log::error!("{}", e);
-                e
-            },
-        )
-    }
-
-    fn del_fd(&self, fd: RawFd, event: DhcpV4Event) -> Result<(), DhcpError> {
-        log::debug!(
-            "Removing fd {} from Epoll {}, event {}",
-            fd,
-            self.fd,
-            event
-        );
-        let event = EpollEvent::new(EpollFlags::EPOLLIN, event as u64);
-        epoll_ctl(self.fd, EpollOp::EpollCtlDel, fd, &mut Some(event)).map_err(
-            |e| {
-                let e = DhcpError::new(
-                    ErrorKind::Bug,
-                    format!(
-                        "Failed to epoll_ctl({}, {:?}, {}, {:?}): {}",
-                        self.fd,
-                        EpollOp::EpollCtlDel,
-                        fd,
-                        event,
-                        e
-                    ),
-                );
-                log::error!("{}", e);
-                e
-            },
-        )
-    }
-
-    fn poll(&self, wait_time: isize) -> Result<Vec<DhcpV4Event>, DhcpError> {
-        let mut events: [EpollEvent; EVENT_BUFFER_COUNT] =
-            [EpollEvent::empty(); EVENT_BUFFER_COUNT];
-
-        loop {
-            match epoll_wait(self.fd, &mut events, 1000 * wait_time) {
-                Ok(c) => {
-                    let mut ret = Vec::new();
-                    for i in &events[..c] {
-                        ret.push(DhcpV4Event::try_from(i.data())?);
-                    }
-                    return Ok(ret);
-                }
-                Err(e) => match e {
-                    nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN => {
-                        // retry
-                        continue;
-                    }
-                    _ => {
-                        let e = DhcpError::new(
-                            ErrorKind::Bug,
-                            format!("Failed on epoll_wait(): {e}"),
-                        );
-                        return Err(e);
-                    }
-                },
-            }
         }
     }
 }

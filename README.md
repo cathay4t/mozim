@@ -16,6 +16,12 @@ TODO:
  * Handle vendor difference: https://gitlab.freedesktop.org/NetworkManager/NetworkManager/-/issues/848
  * Support multiple DHCP servers with `DHCPNAK` reply.
  * Support DHCPNAK
+ * Support `DHCPDECLINE`: Client to server indicating network address is
+   already in use.
+ * Support `DHCPINFORM`: Client to server, asking only for local configuration
+   parameters; client already has externally configured network address.
+ * Rate control -- Token bucket (RFC 2698)
+ * Initial sleep before discovery/solicit(need check RFC)
 
 # Try out
 
