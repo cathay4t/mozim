@@ -4,7 +4,7 @@ use dhcproto::v4::OptionCode;
 
 use super::option::V4_OPT_CODE_MS_CLASSLESS_STATIC_ROUTE;
 use crate::{
-    mac::mac_str_to_u8_array, nispor::get_nispor_iface,
+    mac::mac_str_to_u8_array, netlink::get_iface_index_mac,
     socket::DEFAULT_SOCKET_TIMEOUT, DhcpError,
 };
 
@@ -21,8 +21,8 @@ pub struct DhcpV4Config {
     pub(crate) client_id: Vec<u8>,
     pub(crate) host_name: String,
     // TODO: Support allow list and deny list for DHCP servers.
-    pub(crate) timeout: u32,
-    pub(crate) socket_timeout: u32,
+    pub(crate) timeout_sec: u32,
+    pub(crate) socket_timeout_sec: u32,
     pub(crate) is_proxy: bool,
     pub(crate) request_opts: Vec<OptionCode>,
 }
@@ -35,8 +35,8 @@ impl Default for DhcpV4Config {
             src_mac: String::new(),
             client_id: Vec::new(),
             host_name: String::new(),
-            timeout: DEFAULT_TIMEOUT,
-            socket_timeout: DEFAULT_SOCKET_TIMEOUT,
+            timeout_sec: DEFAULT_TIMEOUT,
+            socket_timeout_sec: DEFAULT_SOCKET_TIMEOUT,
             is_proxy: false,
             request_opts: vec![
                 OptionCode::Hostname,
@@ -61,14 +61,37 @@ impl DhcpV4Config {
         }
     }
 
-    // Check whether interface exists and resolve iface_index and MAC
-    pub(crate) fn init(&mut self) -> Result<(), DhcpError> {
-        let np_iface = get_nispor_iface(self.iface_name.as_str(), false)?;
-        self.iface_index = np_iface.index;
-        if !self.is_proxy {
-            self.src_mac = np_iface.mac_address;
-        }
+    pub fn set_iface_index(&mut self, index: u32) -> &mut Self {
+        self.iface_index = index;
+    }
+
+    pub fn set_iface_mac(&mut self, mac: &str) -> &mut Self {
+        self.src_mac = mac.to_string();
+    }
+
+    pub(crate) fn need_resolve(&self) -> bool {
+        self.iface_index == 0 || self.src_mac.is_empty()
+    }
+
+    #[cfg(feature = "netlink")]
+    pub(crate) async fn resolve_iface_index_and_mac(
+        &mut self,
+    ) -> Result<(), DhcpError> {
+        (self.iface_index, self.src_mac) =
+            get_iface_index_mac(&self.iface_name).await?;
         Ok(())
+    }
+
+    #[cfg(not(feature = "netlink"))]
+    pub(crate) async fn resolve_iface_index_and_mac(
+        &mut self,
+    ) -> Result<(), DhcpError> {
+        Err(DhcpError::new(
+            ErrorKind::InvalidArgument,
+            "Feature `netlink` not enabled, cannot resolve interface {} index \
+             and mac address, please set them manually",
+            self.iface_name,
+        ))
     }
 
     pub fn new_proxy(out_iface_name: &str, proxy_mac: &str) -> Self {
@@ -80,9 +103,9 @@ impl DhcpV4Config {
         }
     }
 
-    // Set timeout in seconds
-    pub fn set_timeout(&mut self, timeout: u32) -> &mut Self {
-        self.timeout = timeout;
+    /// Maximum time for DHCP client to get/refresh a lease
+    pub fn set_timeout_sec(&mut self, timeout_sec: u32) -> &mut Self {
+        self.timeout_sec = timeout_sec;
         self
     }
 

@@ -13,10 +13,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.set_host_name("mozim-test");
     config.use_host_name_as_client_id();
     config.set_timeout(60);
-    let mut cli = DhcpV4ClientAsync::init(config, None).unwrap();
+    let mut cli = DhcpV4ClientAsync::init(config, None).await.unwrap();
 
     loop {
-        if let Some(Ok(lease)) = cli.next().await {
+        if let Ok(lease) = cli.run().await {
             // You need to code to apply the IP address in lease to this NIC, so
             // follow up renew can work.
             println!("Got lease {lease:?}");

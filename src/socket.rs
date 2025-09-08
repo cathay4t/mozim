@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::ffi::CString;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6, UdpSocket};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::io::RawFd;
+use std::{
+    ffi::CString,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV6, UdpSocket},
+    os::{
+        fd::OwnedFd,
+        unix::io::{AsRawFd, RawFd},
+    },
+};
 
-use nix::errno::Errno;
+use nix::{
+    errno::Errno,
+    fcntl::{fcntl, FcntlArg, OFlag},
+    sys::socket::{socket, AddressFamily, SockProtocol, SockType},
+};
+use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     bpf::apply_dhcp_bpf,
@@ -19,21 +28,18 @@ pub(crate) const DEFAULT_SOCKET_TIMEOUT: u32 = 5;
 const PACKET_HOST: u8 = 0; // a packet addressed to the local host
 
 pub(crate) trait DhcpSocket {
-    fn recv(&self) -> Result<Vec<u8>, DhcpError>;
-    fn send(&self, eth_pkg: &[u8]) -> Result<(), DhcpError>;
+    fn recv(&self) -> impl Future<Output = Result<Vec<u8>, DhcpError>> + Send;
+    fn send(
+        &self,
+        eth_pkg: &[u8],
+    ) -> impl Future<Output = Result<(), DhcpError>> + Send;
     fn is_raw(&self) -> bool;
 }
 
 #[derive(Debug, PartialEq, Clone, Default)]
 pub(crate) struct DhcpRawSocket {
     config: DhcpV4Config,
-    raw_fd: libc::c_int,
-}
-
-impl std::os::unix::io::AsRawFd for DhcpRawSocket {
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.raw_fd as std::os::unix::io::RawFd
-    }
+    fd: AsyncFd<OwnedFd>,
 }
 
 impl Drop for DhcpRawSocket {
@@ -49,21 +55,27 @@ impl Drop for DhcpRawSocket {
 impl DhcpRawSocket {
     pub(crate) fn new(config: &DhcpV4Config) -> Result<Self, DhcpError> {
         let iface_index = config.iface_index as libc::c_int;
-        let eth_protocol = libc::ETH_P_ALL;
-        let raw_fd = create_raw_socket(eth_protocol)?;
+        let fd = create_raw_eth_socket()?;
 
-        apply_dhcp_bpf(raw_fd)?;
+        set_socket_non_blocking(fd.as_fd())?;
 
-        bind_raw_socket(raw_fd, eth_protocol, iface_index, &config.src_mac)?;
+        apply_dhcp_bpf(fd.as_rawfd())?;
+
+        bind_raw_socket(
+            fd.as_rawfd(),
+            eth_protocol,
+            iface_index,
+            &config.src_mac,
+        )?;
 
         if config.is_proxy {
-            enable_promiscuous_mode(raw_fd, iface_index)?;
+            enable_promiscuous_mode(fd.as_rawfd(), iface_index)?;
         }
 
         set_socket_timeout(raw_fd, config.socket_timeout)?;
         log::debug!("Raw socket created {raw_fd}");
         Ok(DhcpRawSocket {
-            raw_fd,
+            fd: AsyncFd::new(raw_fd)?,
             config: config.clone(),
         })
     }
@@ -73,16 +85,7 @@ impl DhcpSocket for DhcpRawSocket {
     fn is_raw(&self) -> bool {
         true
     }
-    fn send(&self, eth_pkg: &[u8]) -> Result<(), DhcpError> {
-        if self.raw_fd < 0 {
-            let e = DhcpError::new(
-                ErrorKind::Bug,
-                "Please run DhcpSocket::open_raw() first".to_string(),
-            );
-            log::error!("{e}");
-            return Err(e);
-        }
-
+    async fn send(&self, eth_pkg: &[u8]) -> Result<(), DhcpError> {
         let mut dst_addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         dst_addr.sll_halen = libc::ETH_ALEN as u8;
         dst_addr.sll_addr[..libc::ETH_ALEN as usize]
@@ -171,30 +174,27 @@ impl DhcpSocket for DhcpRawSocket {
     }
 }
 
-fn create_raw_socket(
-    eth_protocol: libc::c_int,
-) -> Result<libc::c_int, DhcpError> {
-    unsafe {
-        match libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW,
-            eth_protocol.to_be() as libc::c_int,
-        ) {
-            -1 => Err(DhcpError::new(
-                ErrorKind::Bug,
-                "libc::socket() failed with -1".to_string(),
-            )),
-            fd => Ok(fd),
-        }
-    }
+fn create_raw_eth_socket() -> Result<OwnedFd, DhcpError> {
+    socket(
+        AddressFamily::Packet,
+        SockType::Raw,
+        Some(SockProtocol::EthAll),
+    )
+    .map_err(|e| {
+        DhcpError::new(
+            ErrorKind::Bug,
+            format!("Failed to create raw ethernet socket: {e}"),
+        )
+    })
 }
 
 fn bind_raw_socket(
-    fd: libc::c_int,
+    fd: RawFd,
     eth_protocol: libc::c_int,
     iface_index: libc::c_int,
     mac_address: &str,
 ) -> Result<(), DhcpError> {
+    CODING
     let mut sll_addr: [libc::c_uchar; 8] = [0; 8];
 
     sll_addr[..libc::ETH_ALEN as usize]
@@ -397,5 +397,15 @@ fn bind_socket_to_iface(fd: RawFd, iface_name: &str) -> Result<(), DhcpError> {
             return Err(e);
         }
     }
+    Ok(())
+}
+
+fn set_socket_non_blocking(fd: BorrowedFd) -> Result<(), DhcpError> {
+    fcntl(fd, FcntlArg::F_SETFD(OFlag::O_NONBLOCK)).map_err(|e| {
+        DhcpError::new(
+            ErrorKind::Bug,
+            format!("Failed to set raw ethernet socket O_NONBLOCK flag: {e}"),
+        )
+    })?;
     Ok(())
 }

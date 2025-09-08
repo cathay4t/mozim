@@ -28,6 +28,16 @@ impl DhcpError {
     pub fn msg(&self) -> &str {
         self.msg.as_str()
     }
+
+    pub fn context(self, msg: T) -> Self
+    where
+        T: std::fmt::Display,
+    {
+        Self {
+            kind: self.kind,
+            msg: format!("{} caused by {}", msg, self.msg),
+        }
+    }
 }
 
 impl std::error::Error for DhcpError {}
